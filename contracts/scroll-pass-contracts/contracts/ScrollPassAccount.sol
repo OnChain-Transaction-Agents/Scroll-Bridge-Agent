@@ -9,21 +9,23 @@ import "./interfaces/IL2GasOracle.sol";
 /**
  * @title Tokenbound ERC-6551 Account Implementation
  * @dev Implementation of an account contract with ERC-6551 compliance, capable of bridging Ether balances and handling gas reimbursements.
+ *
+ * @notice KEY CORE CONTRACTS (for reference during testing):
+ *   ADMIN = <SHOULD MATCH THE APPROPRIATE NFT CONTRACT> ; // NFT ADMIN Contract (CHANGES)
+ *   PAYMASTER = 0xA2d937F18e9E7fC8d295EcAeBb10Acbd5e77e9eC; // Test Funding
+ *
+ *   L1ROUTER = 0x13FBE0D0e5552b8c9c4AE9e2435F38f37355998a; // SEPOLIA (proxy)
+ *   L2ORACLE = 0x247969F4fad93a33d4826046bc3eAE0D36BdE548; // SEPOLIA (proxy)
+ *   L1ROUTER = 0xF8B1378579659D8F7EE5f3C929c2f3E332E41Fd6; // MAINNET (proxy)
+ *   L2ORACLE = 0x987e300fDfb06093859358522a79098848C33852; // MAINNET (proxy)
  */
 contract ScrollPassAccount is AccountV3 {
     /**
      * @dev Emitted when Ether is reimbursed to a specified address.
      * @param to Address receiving the reimbursement.
      * @param amount Amount of Ether reimbursed.
-     * @param gasUsed Gas used for the transaction.
-     * @param gasPrice Price of gas at the time of transaction.
      */
-    event ReimbursedEther(
-        address to,
-        uint256 amount,
-        uint256 gasUsed,
-        uint256 gasPrice
-    );
+    event ReimbursedEther(address to, uint256 amount);
 
     constructor(
         address entryPoint_,
@@ -34,35 +36,41 @@ contract ScrollPassAccount is AccountV3 {
 
     /**
      * @dev Bridges the Ether balance of the contract to another address, reimbursing gas costs.
-     * @param _bridgeGasLimit Gas limit for the bridging transaction.
-     * @param _tbaGasUsed Gas used by the transaction.
+     * @param _adminGasFee Gas limit for the bridging transaction.
+     * @dev key contracts, for reference:
      */
     function bridgeEthBalance(
-        uint256 _bridgeGasLimit,
-        uint256 _tbaGasUsed
+        uint _bridgeGasLimit,
+        uint _adminGasFee // already subsidised if applicable
     ) external payable {
-        // address ADMIN = 0x16b90303e179C4D77ECd2C28a2AB2d0c3E0bAfC7; // hard coded;
-        // address PAYMASTER = 0xC723db325AFD24bed1Bf0cC112E7EF3919bf36c7; // stack too deep
-        address L1ROUTER = 0x13FBE0D0e5552b8c9c4AE9e2435F38f37355998a;
-        address L2ORACLE = 0x247969F4fad93a33d4826046bc3eAE0D36BdE548;
-
-        // check if ADMIN calling + value sent
+        // verify caller + balance to be bridged
         require(
-            msg.sender == 0x16b90303e179C4D77ECd2C28a2AB2d0c3E0bAfC7,
-            "Not Scroller Admin Contract!"
+            msg.sender == 0x6960ef55C6509b7d7E13A85580ef4F7839FB90c0, // NFT ADMIN Contract
+            "TBA: Not Scroll NFT Admin Contract!"
         );
-        require(address(this).balance > 0, "Not enough ETH!");
+        require(address(this).balance > 0, "TBA: Not enough ETH!");
 
-        // reimburse the PAYMASTER gas for this call
-        uint256 adminGasReimbursement = _tbaGasUsed * tx.gasprice;
-        (bool sent, ) = 0xC723db325AFD24bed1Bf0cC112E7EF3919bf36c7.call{
-            value: adminGasReimbursement
+        // add 1% txn fee
+        uint serviceFee = (address(this).balance * 1) / 100;
+
+        // transfer PAYMASTER gas + fee
+        (bool sent, ) = 0xA2d937F18e9E7fC8d295EcAeBb10Acbd5e77e9eC.call{
+            value: _adminGasFee + serviceFee
         }("");
-        require(sent, "Failed to reimburse Admin Contract!");
+        require(sent, "TBA: Failed to reimburse gas and fee!");
+
+        emit ReimbursedEther(
+            0xA2d937F18e9E7fC8d295EcAeBb10Acbd5e77e9eC,
+            _adminGasFee + serviceFee
+        );
 
         // initiate bridge instances
-        IL1GatewayRouter l1GatewayRouter = IL1GatewayRouter(L1ROUTER);
-        IL2GasOracle l2GasOracle = IL2GasOracle(L2ORACLE);
+        IL1GatewayRouter l1GatewayRouter = IL1GatewayRouter(
+            0x13FBE0D0e5552b8c9c4AE9e2435F38f37355998a // sepolia (proxy)
+        );
+        IL2GasOracle l2GasOracle = IL2GasOracle(
+            0x247969F4fad93a33d4826046bc3eAE0D36BdE548 // sepolia (proxy)
+        );
 
         // interact with bridge
         uint256 bridgeFee = _bridgeGasLimit * l2GasOracle.l2BaseFee();
@@ -78,7 +86,7 @@ contract ScrollPassAccount is AccountV3 {
             uint repayment = address(this).balance;
             (bool sent2, ) = owner().call{value: repayment}("");
             require(sent2, "Failed to reimburse Owner!");
-            emit ReimbursedEther(owner(), repayment, 0, 0);
+            emit ReimbursedEther(owner(), repayment);
         }
     }
 }

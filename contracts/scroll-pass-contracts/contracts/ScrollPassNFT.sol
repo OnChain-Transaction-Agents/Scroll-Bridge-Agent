@@ -8,112 +8,59 @@ import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 
-contract ScrollerPass is Ownable, ERC721Enumerable {
-    using Strings for uint256;
-    address private transferWallet;
-    enum Preference {
-        OFF,
-        LOW,
-        MED,
-        HIGH
-    }
+contract ScrollPassNft is Ownable, ERC721Enumerable {
+    using Strings for uint;
 
-    struct TBA {
-        address tbaAddress;
-        Preference preference;
-        bool active;
-        uint256 lastBridge;
-    }
+    uint public constant MINT_FEE = 0.00069 ether;
+    uint minAllowedSubsidyBalance;
+    uint minAllowedTbaBalance;
 
-    mapping(uint256 => TBA) public tokenToTBA;
+    // TODO subsidy to be confirmed with Scroll
+    uint totalSubsidySpent;
+    uint subsidyBalance; // updatable
+    bool subsidyIsActive; // updatable
+
+    string private baseUri;
     address public implementation;
-    address[] public tbaAddresses;
-    string public baseUri;
-    uint256 private _nextTokenId;
-    uint256 private bridgeGasLimit;
-    uint256 private tbaGasUsed;
+    address[] public admins;
 
-    event Minted(
-        uint256 tokenId,
-        address to,
-        address tbaAddress,
-        uint256 valueSent
-    );
+    uint public tbaGasUsed; // for reimbursment to ADMIN
+    uint public bridgeGasLimit; // for core contracts
+    uint private nextTokenId;
+    address private feeWallet;
 
-    event EtherTransferred(address to, uint256 amount);
+    mapping(uint => address) public tbaAddressOf;
+    mapping(uint => uint) public rarityOf;
+    mapping(uint => bool) public hasBridged;
+
+    event Minted(uint tokenId, address to, address tbaAddress, uint valueSent);
+    event EtherTransferred(address to, uint amount);
+    event GasLog(uint gasPaid, uint gasSaved);
 
     constructor(
-        address initialOwner,
-        address _transferWallet
-    ) ERC721("ScrollerPass", "SCROLLNFT") Ownable(initialOwner) {
-        setTransferWallet(_transferWallet);
+        address _initialOwner,
+        address _feeWallet
+    ) ERC721("ScrollPassNft", "SCROLLNFT") Ownable(_initialOwner) {
+        feeWallet = _feeWallet;
+        bridgeGasLimit = 168_000;
+        tbaGasUsed = 350_000;
+        minAllowedSubsidyBalance = 0.01 ether;
+        minAllowedTbaBalance = 0.01 ether;
+        subsidyBalance = 1.5 ether;
+        subsidyIsActive = true;
     }
 
-    function setImplementation(address _implementation) public onlyOwner {
-        implementation = _implementation;
-    }
+    //----------------- MINTING ------------------//
 
-    function setTransferWallet(address _transferWallet) public onlyOwner {
-        transferWallet = _transferWallet;
-    }
+    /**
+     * @dev Mints a new token and creates a TBA account for it
+     * @param to address to mint to
+     * @param chainId chainId of the TBA account
+     */
+    function mint(address to, uint chainId) public payable {
+        require(msg.value >= MINT_FEE, "Insufficient Ether sent for minting");
 
-    function setGasLimit(uint256 _gasLimit) public onlyOwner {
-        bridgeGasLimit = _gasLimit;
-    }
-
-    function setTBAGasUsed(uint256 _tbaGasUsed) public onlyOwner {
-        tbaGasUsed = _tbaGasUsed;
-    }
-
-    function safeMint(address to, uint256 tokenId) public onlyOwner {
-        _safeMint(to, tokenId);
-    }
-
-    function updateTBA(uint256 tokenId, Preference newPreference) public {
-        TBA storage tba = tokenToTBA[tokenId];
-        require(
-            _msgSender() == ownerOf(tokenId),
-            "ERC721: caller is not the owner"
-        );
-        tba.preference = newPreference;
-    }
-
-    function setAdminWallet(address _adminWallet) public onlyOwner {
-        tbaAddresses.push(_adminWallet);
-    }
-
-    function removeAdminWallet(address _adminWallet) public onlyOwner {
-        for (uint256 i = 0; i < tbaAddresses.length; i++) {
-            if (tbaAddresses[i] == _adminWallet) {
-                delete tbaAddresses[i];
-            }
-        }
-    }
-
-    function getTBABalance(uint256 tokenId) public view returns (uint256) {
-        TBA storage tba = tokenToTBA[tokenId];
-        uint256 balance = tba.tbaAddress.balance;
-        return balance;
-    }
-
-    function getTBA(uint256 tokenId) public view returns (TBA memory, uint256) {
-        TBA storage tba = tokenToTBA[tokenId];
-        uint256 balance = getTBABalance(tokenId);
-        return (tba, balance);
-    }
-
-    function setImplementationAddress(
-        address _implementation
-    ) public onlyOwner {
-        implementation = _implementation;
-    }
-
-    function mint(
-        address to,
-        uint256 chainId,
-        Preference preference
-    ) public payable {
-        uint256 tokenId = _nextTokenId++;
+        uint tokenId = nextTokenId++;
         IERC6551Registry registry = IERC6551Registry(
             0x000000006551c19487814612e58FE06813775758
         );
@@ -126,42 +73,118 @@ contract ScrollerPass is Ownable, ERC721Enumerable {
                 tokenId
             )
         );
-        TBA memory tba = TBA(tbaAddress, preference, true, 0);
-        tokenToTBA[tokenId] = tba;
-        _mint(to, tokenId);
+        uint rarity = _generateRarity();
 
+        tbaAddressOf[tokenId] = tbaAddress;
+        rarityOf[tokenId] = rarity;
+
+        _mint(to, tokenId);
         emit Minted(tokenId, to, tbaAddress, msg.value);
 
-        if (msg.value > 0) {
-            (bool sent, ) = tbaAddress.call{value: msg.value}("");
-            require(sent, "Failed to send Ether");
-            emit EtherTransferred(tbaAddress, msg.value);
+        uint mintFee = MINT_FEE;
+        uint depositAmount = msg.value - mintFee;
+
+        (bool sent1, ) = feeWallet.call{value: mintFee}("");
+        require(sent1, "Failed to send mint fee");
+        emit EtherTransferred(feeWallet, mintFee);
+
+        if (depositAmount > 0) {
+            (bool sent2, ) = tbaAddress.call{value: depositAmount}("");
+            require(sent2, "Failed to deposit Ether");
+            emit EtherTransferred(tbaAddress, depositAmount);
         }
     }
 
-    function _isValidAdmin(address _adminWallet) internal view returns (bool) {
-        for (uint256 i = 0; i < tbaAddresses.length; i++) {
-            if (tbaAddresses[i] == _adminWallet) {
-                return true;
+    /**
+     * @dev Generates random number between 1 and 100 and assigns a grade
+     * @return random subsidy grade: 0, 50, 100
+     *
+     * TODO: confirm rarity odds
+     */
+    function _generateRarity() private view returns (uint) {
+        uint randomNum = (block.prevrandao % 100) + 1;
+        return
+            randomNum > 100
+                ? 100 // legendary, subsidy: 100%
+                : randomNum > 95
+                ? 50 // epic, subsidy: 50%
+                : 0; // common, subsidy: 0%
+    }
+
+    //----------------- BRIDGING ------------------//
+
+    function initiateSingleBridge(uint tokenId) internal {
+        address tbaAddress = tbaAddressOf[tokenId];
+        uint rarity = rarityOf[tokenId];
+
+        IAccountV3 accountV3 = IAccountV3(tbaAddress);
+        uint tbaBalance = getTBABalance(tokenId);
+        require(tbaBalance >= minAllowedTbaBalance, "TBA balance too low");
+
+        // gas to be reimbursed to ADMIN
+        uint adminGasFee = tbaGasUsed * tx.gasprice;
+
+        // implement subsidy (if valid)
+        if (subsidyIsActive && totalSubsidySpent < subsidyBalance) {
+            uint gasSubsidy = (tbaGasUsed * tx.gasprice * rarity) / 100; // subsidised
+            uint subsidisedGasFee = adminGasFee - gasSubsidy; // amount to pay
+
+            // call Account and bridge ETH
+            accountV3.bridgeEthBalance(bridgeGasLimit, subsidisedGasFee);
+            emit GasLog(subsidisedGasFee, gasSubsidy);
+            hasBridged[tokenId] = true;
+
+            // update subsidy balance
+            totalSubsidySpent += gasSubsidy;
+            if (totalSubsidySpent >= subsidyBalance) {
+                setSubsidyIsActive(false);
             }
-        }
-        return false;
-    }
-
-    function initiateSingleBridge(uint256 tokenId) internal {
-        TBA storage tba = tokenToTBA[tokenId];
-        IAccountV3 accountV3 = IAccountV3(tba.tbaAddress);
-        uint256 balance = getTBABalance(tokenId);
-        if (balance > 0.01 ether) {
-            accountV3.bridgeEthBalance(bridgeGasLimit, tbaGasUsed);
-            tba.lastBridge = block.timestamp;
+        } else {
+            // call Account and bridge ETH
+            accountV3.bridgeEthBalance(bridgeGasLimit, adminGasFee);
+            emit GasLog(adminGasFee, 0);
+            hasBridged[tokenId] = true;
         }
     }
 
-    function initiateBulkBridge(uint256[] memory tokenIds) public {
+    function initiateBulkBridge(uint[] memory tokenIds) public {
         require(_isValidAdmin(_msgSender()), "Caller is not a valid admin");
-        for (uint256 i = 0; i < tokenIds.length; i++) {
+        for (uint i = 0; i < tokenIds.length; i++) {
             initiateSingleBridge(tokenIds[i]);
+        }
+    }
+
+    //----------------- SETTERS ------------------//
+
+    function setSubsidyBalance(uint _subsidyBalance) public onlyOwner {
+        subsidyBalance = _subsidyBalance;
+    }
+
+    function setSubsidyIsActive(bool _subsidyIsActive) public onlyOwner {
+        subsidyIsActive = _subsidyIsActive;
+    }
+
+    function setImplementation(address _implementation) public onlyOwner {
+        implementation = _implementation;
+    }
+
+    function setGasLimit(uint _gasLimit) public onlyOwner {
+        bridgeGasLimit = _gasLimit;
+    }
+
+    function setTBAGasUsed(uint _tbaGasUsed) public onlyOwner {
+        tbaGasUsed = _tbaGasUsed;
+    }
+
+    function setAdminWallet(address _adminWallet) public onlyOwner {
+        admins.push(_adminWallet);
+    }
+
+    function removeAdminWallet(address _adminWallet) public onlyOwner {
+        for (uint i = 0; i < admins.length; i++) {
+            if (admins[i] == _adminWallet) {
+                delete admins[i];
+            }
         }
     }
 
@@ -169,28 +192,59 @@ contract ScrollerPass is Ownable, ERC721Enumerable {
         baseUri = _baseUri;
     }
 
+    function setMinAllowedSubsidyBalanceWei(
+        uint _minAllowedSubsidyBalance
+    ) public onlyOwner {
+        minAllowedSubsidyBalance = _minAllowedSubsidyBalance;
+    }
+
+    function setMinAllowedTbaBalanceEtherWei(
+        uint _minAllowedTBABalance
+    ) public onlyOwner {
+        minAllowedTbaBalance = _minAllowedTBABalance;
+    }
+
+    //----------------- GETTERS ------------------//
+
+    function getTBABalance(uint tokenId) public view returns (uint) {
+        uint balance = tbaAddressOf[tokenId].balance;
+        return balance;
+    }
+
     function tokenURI(
-        uint256 _tokenId
+        uint _tokenId
     ) public view override returns (string memory) {
         return string(abi.encodePacked(baseUri, Strings.toString(_tokenId)));
     }
 
-    function withdrawAll() public onlyOwner {
-        uint256 balance = address(this).balance;
-        require(balance > 0);
-        _withdraw(transferWallet, balance);
+    function _isValidAdmin(address _adminWallet) internal view returns (bool) {
+        for (uint i = 0; i < admins.length; i++) {
+            if (admins[i] == _adminWallet) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    function _withdraw(address _address, uint256 _amount) private {
+    //----------------- ADMIN FUNCTIONS ------------------//
+
+    function withdrawAll() public onlyOwner {
+        uint balance = address(this).balance;
+        require(balance > 0);
+        _withdraw(feeWallet, balance);
+    }
+
+    function _withdraw(address _address, uint _amount) private {
         (bool success, ) = _address.call{value: _amount}("");
         require(success, "Transfer failed.");
     }
 
+    //----------------- OVERRIDES ------------------//
     // The following functions are overrides required by Solidity.
 
     function _update(
         address to,
-        uint256 tokenId,
+        uint tokenId,
         address auth
     ) internal override(ERC721Enumerable) returns (address) {
         return super._update(to, tokenId, auth);
@@ -207,5 +261,15 @@ contract ScrollerPass is Ownable, ERC721Enumerable {
         bytes4 interfaceId
     ) public view override(ERC721Enumerable) returns (bool) {
         return super.supportsInterface(interfaceId);
+    }
+
+    //----------------- TESTING HELPER FUNCTIONS --------//
+
+    function setRarity(uint tokenId, uint _rarity) external onlyOwner {
+        require(
+            _rarity == 0 || _rarity == 33 || _rarity == 66 || _rarity == 100,
+            "Invalid rarity"
+        );
+        rarityOf[tokenId] = _rarity;
     }
 }

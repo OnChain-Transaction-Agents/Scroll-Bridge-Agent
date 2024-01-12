@@ -6,8 +6,4 @@ interface IAccountV3 {
         uint256 _txnAmount,
         uint256 _gasLimit
     ) external payable;
-
-    function withdrawETH(uint256 _amount, uint256 _gasLimit) external;
-
-    function getETHGateway() external view returns (address);
 }
