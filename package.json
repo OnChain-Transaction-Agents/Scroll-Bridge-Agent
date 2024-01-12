@@ -1,0 +1,10 @@
+{
+    "name": "@scroll-bridge-agent/root",
+    "version": "1.0.0",
+    "private": true,
+    "workspaces": [
+        "contracts/*",
+        "apps/*",
+        "services/*"
+      ]
+  }
